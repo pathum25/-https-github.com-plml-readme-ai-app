@@ -1,0 +1,60 @@
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+const Fuse = require('fuse.js');
+const { OpenAIApi, Configuration } = require('openai');
+
+const PORT = process.env.PORT || 3000;
+const USE_OPENAI = !!process.env.OPENAI_API_KEY;
+let openai;
+if (USE_OPENAI) {
+  const config = new Configuration({ apiKey: process.env.OPENAI_API_KEY });
+  openai = new OpenAIApi(config);
+}
+
+const app = express();
+app.use(express.json());
+
+// Load knowledge file(s)
+const CODE_PATH = path.join(__dirname, '..', 'data', 'CODEOWNERS.txt');
+const codeText = fs.existsSync(CODE_PATH) ? fs.readFileSync(CODE_PATH, 'utf8') : '';
+// Split into simple lines/chunks for fuzzy search
+const chunks = codeText.split('\n').map((t, i) => ({ id: i, text: t.trim() })).filter(c => c.text);
+
+const fuse = new Fuse(chunks, { keys: ['text'], includeScore: true, threshold: 0.4 });
+
+app.get('/', (req, res) => res.send('Readme-AI app (CODEOWNERS Q&A). POST /qa'));
+
+app.post('/qa', async (req, res) => {
+  const question = (req.body?.question || '').trim();
+  if (!question) return res.status(400).json({ error: 'question is required' });
+
+  const results = fuse.search(question, { limit: 5 }).map(r => ({ id: r.item.id, text: r.item.text, score: r.score }));
+
+  // If no OpenAI key, return the top matches
+  if (!USE_OPENAI) {
+    return res.json({ answer: null, source_matches: results });
+  }
+
+  // Build a prompt with the top matches
+  const context = results.map(r => `- ${r.text}`).join('\n');
+  const prompt = `You are an assistant that answers questions using the following CODEOWNERS lines as source material:\n${context}\n\nAnswer the question concisely:\nQ: ${question}\nA:`;
+
+  try {
+    const completion = await openai.createChatCompletion({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 300
+    });
+    const answer = completion.data.choices?.[0]?.message?.content?.trim() || null;
+    return res.json({ answer, source_matches: results });
+  } catch (err) {
+    console.error('OpenAI error', err?.response?.data || err.message || err);
+    return res.status(500).json({ error: 'OpenAI request failed', details: err?.message });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Readme-AI app listening on http://localhost:${PORT}`);
+  console.log(`OPENAI integration: ${USE_OPENAI ? 'enabled' : 'disabled'}`);
+});
